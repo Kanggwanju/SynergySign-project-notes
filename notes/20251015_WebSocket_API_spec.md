@@ -4,7 +4,7 @@
 STOMP 프로토콜을 사용하며, REST API와의 역할 분리를 명확히 합니다.
 
 * **작성일**: 2025-10-15
-* **버전**: v1.6.0
+* **버전**: v1.8.0
 * **프로토콜**: STOMP over WebSocket
 * **기반 문서**: 기능 요구사항 명세서 v1.0.0, 사용자 흐름도 명세서 v1.0.1
 
@@ -47,15 +47,15 @@ SignBell은 **하이브리드 접근 방식**을 사용합니다.
     |    (좌표 데이터)         |                      |
     |                         |                      |
     |                         | AI 모델 판정          |
-    |                         | (정답/오답/유사도)     |
+    |                         | (정답/오답)           |
     |                         |                      |
     |<-- HTTP Response -------|                      |
     |    (판정 결과)           |                      |
     |                         |                      |
     |--- WebSocket SEND ----------------------->|
-    |    (결과만 전송: isCorrect, similarity)    |
+    |    (결과만 전송: isCorrect)                |
     |                         |                      |
-    |                         |            점수 계산 (Redis) |
+    |                         |            점수 계산 (HashMap) |
     |                         |            실시간 랭킹 업데이트 |
     |                         |                      |
     |<-- WebSocket (ANSWER_RESULT) --------------|
@@ -65,13 +65,14 @@ SignBell은 **하이브리드 접근 방식**을 사용합니다.
 **FastAPI 서버 역할:**
 - 좌표 데이터 수신
 - AI 모델로 수어 동작 판정
-- 정답 여부 및 유사도 반환
+- 정답 여부 반환
 
 **백엔드(Spring) 역할:**
 - 판정 결과만 수신
-- 메모리(Redis/HashMap)에서 점수 관리 (1~7번 문제)
+- 메모리(HashMap)에서 점수 관리 (1~7번 문제)
 - WebSocket으로 실시간 랭킹 브로드캐스트
 - 8번 문제 완료 시 DB(game_history)에 최종 점수 저장
+
 ```
 [사용자 플로우]
 1. REST API GET /api/quiz/rooms → 방 리스트 조회
@@ -661,11 +662,6 @@ const goToNextQuestion = () => {
 5. 모든 참여자에게 전송
 6. GameRoom.currentRound 값은 퀴즈 종료 시 증가
 
-**videoUrl을 보내지 않는 이유:**
-- 클라이언트가 quizWordId를 기반으로 비디오 경로를 추론 가능
-- 또는 별도 API로 비디오 URL 조회 가능
-- 네트워크 페이로드 최소화
-
 **Error Cases:**
 - `403 Forbidden`: `NOT_ROOM_HOST` - 방장 권한 없음
 - `400 Bad Request`: `ROOM_MIN_PARTICIPANTS_NOT_MET` - 최소 인원 부족 (2명 미만)
@@ -674,40 +670,23 @@ const goToNextQuestion = () => {
 
 ---
 
-### 6.4 문제 출제
-
-**[Server → Room]**
-```
-SEND /topic/room/{gameRoomId}/quiz
-
-{
-  "success": true,
-  "message": "문제가 출제되었습니다.",
-  "timestamp": "2025-10-15T14:30:00",
-  "data": {
-    "eventType": "QUESTION_ISSUED",
-    "questionId": "Q001",
-    "word": "안녕하세요",
-    "videoUrl": "https://cdn.signbell.com/signs/hello.mp4",
-    "round": 1,
-    "totalRounds": 10,
-    "answerTimeLimit": 8000  // 밀리초 (3초 카운트다운 + 5초 동작)
-  }
-}
-```
-
----
-
-### 6.5 정답 도전하기 (버튼 클릭)
+### 6.4 정답 도전하기 (버튼 클릭)
 
 **[Client → Server]**
 ```
 SEND /app/room/{gameRoomId}/quiz/challenge
 
 {
-  "questionId": "Q001"
+  "quizWordId": 101,
+  "questionNumber": 1
 }
 ```
+
+**Request Spec:**
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `quizWordId` | `Long` | 퀴즈 단어 ID |
+| `questionNumber` | `Integer` | 문제 번호 (1~8) |
 
 **[Server → Room]** (선착순 획득)
 ```
@@ -721,9 +700,46 @@ SEND /topic/room/{gameRoomId}/quiz
     "eventType": "CHALLENGE_ACQUIRED",
     "userId": 101,
     "nickname": "user456",
-    "questionId": "Q001",
-    "countdownStart": 3  // 3초 카운트다운
+    "quizWordId": 101,
+    "questionNumber": 1,
+    "round": 1,
+    "challengeOrder": 1,
+    "countdownStart": 3
   }
+}
+```
+
+**응답 데이터 설명:**
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `challengeOrder` | `Integer` | 해당 문제에서 몇 번째로 도전하는지 (1, 2, 3, 4) |
+| `countdownStart` | `Integer` | 카운트다운 시작 (3초) |
+
+**서버 처리 로직:**
+```java
+// 각 문제마다 도전 순서를 추적
+private final Map<String, AtomicInteger> challengeOrderMap = new ConcurrentHashMap<>();
+// Key: "gameRoomId:questionNumber", Value: 도전 순서
+
+@MessageMapping("/room/{gameRoomId}/quiz/challenge")
+public void handleChallenge(@DestinationVariable Long gameRoomId,
+                             @Payload ChallengeRequest request) {
+    
+    String key = gameRoomId + ":" + request.getQuestionNumber();
+    
+    // 도전 순서 증가 (1, 2, 3, 4)
+    int challengeOrder = challengeOrderMap
+        .computeIfAbsent(key, k -> new AtomicInteger(0))
+        .incrementAndGet();
+    
+    // 최대 4명까지만 허용
+    if (challengeOrder > 4) {
+        sendError(userId, "QUIZ_MAX_ATTEMPTS_REACHED");
+        return;
+    }
+    
+    // CHALLENGE_ACQUIRED 브로드캐스트
+    sendChallengeAcquired(gameRoomId, userId, request, challengeOrder);
 }
 ```
 
@@ -744,6 +760,26 @@ SEND /user/queue/errors
 
 ### 6.5 점수 계산 및 랭킹 업데이트
 
+**[Client → Server]**
+```
+SEND /app/room/{gameRoomId}/quiz/result
+
+{
+  "quizWordId": 101,
+  "questionNumber": 1,
+  "challengeOrder": 1,
+  "isCorrect": true
+}
+```
+
+**Request Spec:**
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `quizWordId` | `Long` | 퀴즈 단어 ID |
+| `questionNumber` | `Integer` | 문제 번호 (1~8) |
+| `challengeOrder` | `Integer` | 6.4에서 받은 도전 순서 (1~4) |
+| `isCorrect` | `Boolean` | 정답 여부 |
+
 **[Server → Room]** (메모리 기반 점수 관리)
 ```
 SEND /topic/room/{gameRoomId}/quiz
@@ -758,8 +794,9 @@ SEND /topic/room/{gameRoomId}/quiz
     "nickname": "user456",
     "quizWordId": 101,
     "questionNumber": 1,
+    "round": 1,
+    "challengeOrder": 1,
     "isCorrect": true,
-    "similarity": 0.87,
     "scoreChange": 100,
     "currentScore": 100,
     "ranking": [
@@ -771,13 +808,12 @@ SEND /topic/room/{gameRoomId}/quiz
 ```
 
 **점수 규칙:**
-| 순위 | 점수 |
-|------|------|
-| 1위 | +100점 |
-| 2위 | +90점 |
-| 3위 | +80점 |
-| 4위 | +70점 |
-| 오답 | -50점 |
+| 도전 순서 (challengeOrder) | 정답 시 | 오답 시 |
+|---------------------------|---------|---------|
+| 1번째 | +100점 | -50점 |
+| 2번째 | +90점 | -50점 |
+| 3번째 | +80점 | -50점 |
+| 4번째 | +70점 | -50점 |
 
 **백엔드 처리 로직:**
 ```java
@@ -788,26 +824,45 @@ public void handleQuizResult(@DestinationVariable Long gameRoomId,
     
     Long userId = Long.valueOf(subject);
     
-    // 1. 메모리(Redis/HashMap)에서 현재 점수 조회
+    // 1. challengeOrder 검증 (서버에서 발급한 순서인지 확인)
+    validateChallengeOrder(gameRoomId, userId, request.getQuestionNumber(), 
+                          request.getChallengeOrder());
+    
+    // 2. 메모리(HashMap)에서 현재 점수 조회
     Integer currentScore = scoreCache.get(gameRoomId, userId);
     
-    // 2. 점수 계산
-    int scoreChange = calculateScore(request.isCorrect(), getRanking(gameRoomId));
+    // 3. 점수 계산 (도전 순서 기반)
+    int scoreChange = calculateScore(request.isCorrect(), request.getChallengeOrder());
     Integer newScore = currentScore + scoreChange;
     
-    // 3. 메모리에 업데이트 (1~7번 문제)
+    // 4. 메모리에 업데이트 (1~7번 문제)
     scoreCache.put(gameRoomId, userId, newScore);
     
-    // 4. 실시간 랭킹 조회 (메모리에서)
+    // 5. 실시간 랭킹 조회 (메모리에서)
     List<RankingDto> ranking = scoreCache.getRanking(gameRoomId);
     
-    // 5. 모든 참가자에게 브로드캐스트
+    // 6. 모든 참가자에게 브로드캐스트
     sendAnswerResult(gameRoomId, userId, request, scoreChange, newScore, ranking);
     
-    // 6. 8번 문제 완료 시 DB 저장
+    // 7. 8번 문제 완료 시 DB 저장
     if (request.getQuestionNumber() == 8) {
         saveToDatabase(gameRoomId, userId, newScore);
     }
+}
+
+private int calculateScore(boolean isCorrect, int challengeOrder) {
+    if (!isCorrect) {
+        return -50;  // 오답
+    }
+    
+    // 정답인 경우, 도전 순서에 따라 점수 차등 지급
+    return switch(challengeOrder) {
+        case 1 -> 100;
+        case 2 -> 90;
+        case 3 -> 80;
+        case 4 -> 70;
+        default -> 0;  // 5번째 이상은 점수 없음
+    };
 }
 
 private void saveToDatabase(Long gameRoomId, Long userId, Integer finalScore) {
@@ -824,18 +879,21 @@ private void saveToDatabase(Long gameRoomId, Long userId, Integer finalScore) {
 }
 ```
 
-**메모리 캐시 구조 (Redis 예시):**
-```
-Key: game:{gameRoomId}:scores
-Value: HashMap<userId, score>
+**메모리 캐시 구조 (HashMap):**
+```java
+// ScoreCache.java
+private final Map<Long, Map<Long, Integer>> roomScores = new ConcurrentHashMap<>();
+// Key: gameRoomId, Value: Map<userId, score>
 
-예시:
-game:123:scores = {
-  "101": 100,
-  "102": 90,
-  "103": -50,
-  "104": 0
-}
+// 예시:
+// roomScores = {
+//   123: {
+//     101: 100,
+//     102: 90,
+//     103: -50,
+//     104: 0
+//   }
+// }
 ```
 
 **프론트엔드 처리:**
@@ -861,7 +919,7 @@ case 'ANSWER_RESULT':
 
 ---
 
-### 6.7 퀴즈 종료
+### 6.6 퀴즈 종료
 
 **[Server → Room]**
 ```
@@ -979,7 +1037,7 @@ case 'QUIZ_FINISHED':
 
 ---
 
-### 6.8 WebRTC 시그널링
+### 6.7 WebRTC 시그널링
 
 #### Offer
 **[Client → Server]**
@@ -1131,7 +1189,6 @@ SEND /topic/room/{gameRoomId}/errors
 |------|--------|--------|----------|
 | `COORDINATE_EXTRACTION_FAILED` | 좌표 추출에 실패했습니다 | 500 | 프론트엔드 |
 | `AI_MODEL_ERROR` | AI 모델 처리 중 오류가 발생했습니다 | 500 | FastAPI |
-| `SIMILARITY_CHECK_FAILED` | 유사도 검사에 실패했습니다 | 500 | FastAPI |
 | `AI_MODEL_TIMEOUT` | AI 모델 응답 시간이 초과되었습니다 | 504 | FastAPI |
 | `INVALID_COORDINATE_DATA` | 유효하지 않은 좌표 데이터입니다 | 400 | FastAPI |
 | `SCORE_UPDATE_FAILED` | 점수 업데이트에 실패했습니다 | 500 | 백엔드 |
@@ -1231,7 +1288,7 @@ client.subscribe('/user/queue/errors', (message) => {
 ### 8.2 Heartbeat
 ```javascript
 const client = new Client({
-  brokerURL: 'ws://localhost:8080/ws',
+  brokerURL: 'ws://localhost:9000/ws',
   heartbeatIncoming: 10000,  // 서버 → 클라이언트 (10초)
   heartbeatOutgoing: 10000,  // 클라이언트 → 서버 (10초)
 });
@@ -1240,7 +1297,7 @@ const client = new Client({
 ### 8.3 재연결 전략
 ```javascript
 const client = new Client({
-  brokerURL: 'ws://localhost:8080/ws',
+  brokerURL: 'ws://localhost:9000/ws',
   reconnectDelay: 5000,  // 5초 후 재연결
   
   onWebSocketClose: () => {
@@ -1288,7 +1345,7 @@ Client (방장)    Backend(Spring)    FastAPI Server    Other Clients
   |--- /app/room/123/quiz/start -------------------------->|
   |                  |                    |                  |
   |                  | (8개 단어 선택)    |                  |
-  |                  | (Redis 초기화)     |                  |
+  |                  | (HashMap 초기화)   |                  |
   |                  |                    |                  |
   |<-- QUIZ_STARTED -|--- QUIZ_STARTED ---------------------->|
   |  (round: 1)      |    (round: 1)      |                  |
@@ -1300,6 +1357,7 @@ Client (방장)    Backend(Spring)    FastAPI Server    Other Clients
   | [정답 도전하기]   |                    |   [정답 도전하기] |
   |                  |<-- /challenge (먼저!)                 |
   |<-- CHALLENGE_ACQUIRED|-- CHALLENGE_ACQUIRED ------------->|
+  |  (challengeOrder:1)  |  (challengeOrder:1)  |            |
   |                  |                    |                  |
   |                  | (3초 카운트다운)    |                  |
   |                  | (5초 동작 수행)    |                  |
@@ -1310,11 +1368,14 @@ Client (방장)    Backend(Spring)    FastAPI Server    Other Clients
   |    (좌표 데이터)             |          |                  |
   |                  |          |  AI 모델 판정              |
   |<-- HTTP Response ------------|          |                  |
-  |    (isCorrect, similarity)   |          |                  |
+  |    (isCorrect)              |          |                  |
   |                  |                    |                  |
   |--- /app/room/123/quiz/result -------->|                  |
-  |    (판정 결과만)  |                    |                  |
-  |                  | (Redis 점수 업데이트) |                |
+  |    (challengeOrder:1, isCorrect)      |                  |
+  |                  |                    |                  |
+  |                  | (challengeOrder 검증) |               |
+  |                  | (HashMap 점수 업데이트) |              |
+  |                  | (1등: +100점)      |                  |
   |                  | (실시간 랭킹 조회)   |                |
   |                  |                    |                  |
   |<-- ANSWER_RESULT -|--- ANSWER_RESULT ---------------------->|
@@ -1323,13 +1384,23 @@ Client (방장)    Backend(Spring)    FastAPI Server    Other Clients
   | (클라이언트가 2번 문제 출제)            |                  |
   |<=========== 문제 2번 표시 ==============================>|
   |                  |                    |                  |
+  | [정답 도전하기]   |<-- /challenge      |   [정답 도전하기] |
+  |<-- CHALLENGE_ACQUIRED|-- CHALLENGE_ACQUIRED ------------->|
+  |  (challengeOrder:1)  |  (challengeOrder:1)  |            |
+  |                  |                    |                  |
+  |                  |                    |  [정답 도전하기]  |
+  |                  |                    |<-- /challenge    |
+  |                  |--- CHALLENGE_ACQUIRED --------------->|
+  |                  |                    |  (challengeOrder:2)|
+  |                  |                    |                  |
   | (반복... 8번 문제까지)                 |                  |
   |                  |                    |                  |
   | (8번 문제 완료)   |                    |                  |
   |--- /app/room/123/quiz/result -------->|                  |
-  |                  | (Redis → DB 저장)  |                  |
+  |    (challengeOrder, isCorrect)        |                  |
+  |                  | (HashMap → DB 저장) |                 |
   |                  | (game_history 기록) |                 |
-  |                  | (Redis 초기화)     |                  |
+  |                  | (HashMap 초기화)   |                  |
   |                  | (round 증가: 1→2)  |                  |
   |                  | (status: WAITING)  |                  |
   |<-- QUIZ_FINISHED -|--- QUIZ_FINISHED ---------------------->|
@@ -1342,9 +1413,10 @@ Client (방장)    Backend(Spring)    FastAPI Server    Other Clients
 **핵심 포인트:**
 1. ✅ 좌표 데이터는 **FastAPI 서버**로만 전송
 2. ✅ AI 판정 결과만 백엔드로 전송
-3. ✅ 1~7번 문제: Redis에서 점수 관리
-4. ✅ 8번 문제: DB(game_history)에 최종 저장
-5. ✅ 퀴즈 종료 후 Redis 초기화
+3. ✅ **challengeOrder**를 통해 점수 차등 지급 (1등: 100점, 2등: 90점, 3등: 80점, 4등: 70점)
+4. ✅ 1~7번 문제: HashMap에서 점수 관리
+5. ✅ 8번 문제: DB(game_history)에 최종 저장
+6. ✅ 퀴즈 종료 후 HashMap 초기화
 
 ### 9.3 방장 퇴장 시 방 종료 플로우
 ```
@@ -1404,6 +1476,7 @@ function QuizRoom() {
   const [roomData, setRoomData] = useState(null);
   const [questions, setQuestions] = useState([]);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [currentChallengeOrder, setCurrentChallengeOrder] = useState(null);
   
   // 1. 방 생성 (REST API)
   const createRoom = async (gameTitle) => {
@@ -1535,10 +1608,19 @@ function QuizRoom() {
         
       case 'CHALLENGE_ACQUIRED':
         console.log(`${response.data.nickname}님 도전!`);
+        
+        // 내가 도전권을 얻었다면 challengeOrder 저장
+        if (response.data.userId === currentUserId) {
+          setCurrentChallengeOrder(response.data.challengeOrder);
+        }
         break;
         
       case 'ANSWER_RESULT':
         console.log('결과:', response.data.isCorrect ? '정답' : '오답');
+        console.log(`도전 순서: ${response.data.challengeOrder}등`);
+        
+        // challengeOrder 초기화
+        setCurrentChallengeOrder(null);
         
         // 다음 문제로 진행
         goToNextQuestion();
@@ -1555,9 +1637,9 @@ function QuizRoom() {
     console.log('문제 출제:', question);
     
     // UI에 문제 표시
-    // - question.word: 단어
-    // - question.videoUrl: 설명 영상
-    // - question.questionId: 문제 ID (답변 제출 시 사용)
+    // - question.title: 단어
+    // - question.quizWordId: 비디오 URL 추론에 사용
+    // - question.questionNumber: 문제 번호
   };
   
   // 7. 다음 문제로 진행
@@ -1572,22 +1654,42 @@ function QuizRoom() {
         issueQuestion(questions[nextIndex]);
       }, 3000);
     } else {
-      // 마지막 문제 완료 - 서버에 퀴즈 종료 알림 (선택)
+      // 마지막 문제 완료
       console.log('모든 문제 완료');
     }
   };
   
   // 8. 정답 도전하기
-  const handleChallenge = (questionId) => {
+  const handleChallenge = (quizWordId, questionNumber) => {
     if (client && roomData) {
       client.publish({
         destination: `/app/room/${roomData.gameRoomId}/quiz/challenge`,
-        body: JSON.stringify({ questionId })
+        body: JSON.stringify({ quizWordId, questionNumber })
       });
     }
   };
   
-  // 9. WebRTC 시그널링 핸들러
+  // 9. AI 판정 후 결과 제출
+  const submitQuizResult = async (quizWordId, questionNumber, isCorrect) => {
+    if (!currentChallengeOrder) {
+      console.error('도전 순서가 없습니다. 먼저 정답 도전하기 버튼을 눌러주세요.');
+      return;
+    }
+    
+    if (client && roomData) {
+      client.publish({
+        destination: `/app/room/${roomData.gameRoomId}/quiz/result`,
+        body: JSON.stringify({ 
+          quizWordId, 
+          questionNumber, 
+          challengeOrder: currentChallengeOrder,
+          isCorrect 
+        })
+      });
+    }
+  };
+  
+  // 10. WebRTC 시그널링 핸들러
   const handleWebRTCSignaling = (message) => {
     const response = JSON.parse(message.body);
     
@@ -1604,7 +1706,7 @@ function QuizRoom() {
     }
   };
   
-  // 10. 방 퇴장 (자발적)
+  // 11. 방 퇴장 (자발적)
   const leaveRoom = () => {
     if (!client || !roomData) return;
     
@@ -1633,7 +1735,7 @@ function QuizRoom() {
     window.location.href = '/quiz/rooms';
   };
   
-  // 11. 정리
+  // 12. 정리
   useEffect(() => {
     return () => {
       client?.deactivate();
@@ -1667,7 +1769,7 @@ function QuizRoom() {
 | 정답 도전 시간 | 8초 (3초 카운트다운 + 5초 동작) | 프론트엔드 |
 | AI 판정 타임아웃 | 5초 | FastAPI |
 | 좌표 데이터 최대 크기 | 5MB | FastAPI |
-| Redis 캐시 TTL | 1시간 | 백엔드 |
+| HashMap 캐시 TTL | 1시간 | 백엔드 |
 
 ### 11.5 브라우저 호환성
 - Chrome 90+
@@ -1693,6 +1795,8 @@ function QuizRoom() {
 | v1.4.0 | 2025-10-15 | 개발 포트 9000번 변경, TypeScript → JavaScript, 퀴즈 시작 시 8개 단어 일괄 전송, 클라이언트 주도 문제 출제 방식, 무한 스크롤 명시 | Claude |
 | v1.5.0 | 2025-10-15 | round 개념 변경 (문제번호 → 게임진행횟수), questionNumber 필드 추가, quizWordId + title만 전송 (videoUrl 제거), 퀴즈 종료 시 round 증가 로직 추가 | Claude |
 | v1.6.0 | 2025-10-15 | AI 판정 플로우 변경 (프론트→FastAPI→프론트→백엔드), Redis/HashMap 기반 점수 관리 (1~7번), DB 저장 시점 명시 (8번 완료 시), 좌표 데이터는 백엔드로 미전송 | Claude |
+| v1.7.0 | 2025-10-15 | videoUrl 관련 설명 제거, 6.4 문제 출제 섹션 삭제, 동작 제출 섹션 삭제, similarity 필드 제거, Redis → HashMap 변경 | Claude |
+| v1.8.0 | 2025-10-15 | challengeOrder 필드 추가 (6.4, 6.5), 점수 계산 로직 개선 (도전 순서 기반), 시퀀스 다이어그램 업데이트 | Claude |
 
 ---
 
@@ -1701,5 +1805,3 @@ function QuizRoom() {
 - [Spring WebSocket](https://docs.spring.io/spring-framework/reference/web/websocket.html)
 - [@stomp/stompjs](https://github.com/stomp-js/stompjs)
 - SignBell 퀴즈 REST API 명세서
-
-6.3 퀴즈 시작 (방장만)의 videoUrl을 보내지 않는 이유는 그냥 삭제해도 될거같아. 그리고, 6.4 문제 출제부분에서 videoUrl 삭제, 6.3과 비슷하게 quizWordId로 작성, 라운드 수정 필요해 보여. 그리고 6.5의 동작 제출 및 AI 판정하는 부분은 아예 삭제해도 될거같아 백엔드랑 관련없는 일이라고 생각돼. 그리고 6.6에서 similarity는 없어도 될거같아. 그리고 우리는 Redis를 사용하지 않고, HashMap을 사용하려고 해. 내가 말한 관련사항들을 수정해줄수있겠어?
