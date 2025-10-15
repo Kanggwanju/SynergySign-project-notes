@@ -462,7 +462,7 @@ SUBSCRIBE /topic/room/{gameRoomId}/participant
 
 ### 6.2 방 퇴장
 
-#### 6.2.1 일반 참가자 퇴장
+#### 6.2.1 자발적 퇴장 (일반 참가자)
 
 **[Client → Server]**
 ```
@@ -485,14 +485,91 @@ SEND /topic/room/{gameRoomId}/participant
     "eventType": "PARTICIPANT_LEFT",
     "userId": 101,
     "nickname": "user456",
+    "reason": "MANUAL",
     "currentParticipants": 2
   }
 }
 ```
 
-#### 6.2.2 방장 퇴장 (방 종료)
+#### 6.2.2 비자발적 퇴장 (연결 해제)
 
-**[Client → Server]**
+**상황:**
+- 인터넷 연결 끊김
+- 브라우저 탭 닫기
+- 네트워크 타임아웃
+- 클라이언트 충돌
+
+**서버 감지 메커니즘:**
+```java
+@EventListener
+public void handleWebSocketDisconnect(SessionDisconnectEvent event) {
+    StompHeaderAccessor accessor = StompHeaderAccessor.wrap(event.getMessage());
+    String sessionId = accessor.getSessionId();
+    
+    // 세션에서 사용자 정보 조회
+    Long userId = getUserIdFromSession(sessionId);
+    Long gameRoomId = getGameRoomIdFromSession(sessionId);
+    
+    if (userId != null && gameRoomId != null) {
+        // 자동 퇴장 처리
+        handleAutoLeave(gameRoomId, userId, "CONNECTION_LOST");
+    }
+}
+```
+
+**타임아웃 설정:**
+| 항목 | 시간 | 설명 |
+|------|------|------|
+| Heartbeat Timeout | 20초 | Heartbeat 미수신 시 연결 해제 |
+| Session Timeout | 30초 | 세션 비활성 시 자동 정리 |
+| Reconnect Grace Period | 5초 | 재연결 유예 시간 (선택적) |
+
+**[Server → Room]**
+```
+SEND /topic/room/{gameRoomId}/participant
+
+{
+  "success": true,
+  "message": "참가자의 연결이 끊어졌습니다.",
+  "timestamp": "2025-10-15T14:30:00",
+  "data": {
+    "eventType": "PARTICIPANT_LEFT",
+    "userId": 101,
+    "nickname": "user456",
+    "reason": "CONNECTION_LOST",
+    "currentParticipants": 2
+  }
+}
+```
+
+**재연결 처리 (선택적):**
+```javascript
+const client = new Client({
+  brokerURL: 'ws://localhost:9000/ws',
+  reconnectDelay: 5000,
+  
+  onWebSocketClose: () => {
+    console.log('연결 끊김 - 5초 후 재연결 시도');
+  },
+  
+  onConnect: () => {
+    // 재연결 성공 시 자동으로 방 재입장
+    const lastRoomId = localStorage.getItem('lastRoomId');
+    if (lastRoomId) {
+      rejoinRoom(lastRoomId);
+    }
+  }
+});
+```
+
+**재입장 제한:**
+- 퀴즈가 이미 시작된 경우 재입장 불가
+- 방이 삭제된 경우 재입장 불가
+- 대기실 상태인 경우에만 재입장 허용
+
+#### 6.2.3 방장 퇴장 (방 종료)
+
+**[Client → Server]** (자발적 또는 비자발적)
 ```
 SEND /app/room/{gameRoomId}/leave
 
@@ -511,7 +588,7 @@ SEND /topic/room/{gameRoomId}/participant
   "timestamp": "2025-10-15T14:30:00",
   "data": {
     "eventType": "ROOM_CLOSED",
-    "reason": "HOST_LEFT",
+    "reason": "HOST_LEFT",  // 또는 "HOST_DISCONNECTED"
     "hostNickname": "user123",
     "redirectTo": "/quiz/rooms"
   }
@@ -521,7 +598,8 @@ SEND /topic/room/{gameRoomId}/participant
 **서버 처리 로직:**
 1. GameRoom 상태를 `FINISHED`로 변경
 2. 모든 GameParticipant 삭제
-3. 남은 참가자들에게 `ROOM_CLOSED` 이벤트 발송
+3. 메모리 캐시(HashMap) 정리
+4. 남은 참가자들에게 `ROOM_CLOSED` 이벤트 발송
 
 **클라이언트 처리:**
 ```typescript
@@ -530,17 +608,26 @@ case 'ROOM_CLOSED':
   client?.deactivate();
   
   // 2. 사용자 알림
-  toast.warning(response.message);
+  const message = data.reason === 'HOST_DISCONNECTED' 
+    ? '방장의 연결이 끊어져 방이 종료되었습니다.'
+    : '방장이 퇴장하여 방이 종료되었습니다.';
+  toast.warning(message);
   
   // 3. 방 목록으로 자동 리다이렉트
   navigate('/quiz/rooms');
   break;
 ```
 
+**reason 값:**
+| 값 | 설명 |
+|-----|------|
+| `HOST_LEFT` | 방장이 자발적으로 퇴장 |
+| `HOST_DISCONNECTED` | 방장의 연결이 끊김 |
+
 **특이사항:**
-- 방장이 퇴장하면 **방이 즉시 종료**됨 (방장 승계 없음)
+- 방장이 퇴장(자발적/비자발적)하면 **방이 즉시 종료**됨 (방장 승계 없음)
 - 남은 참가자들은 자동으로 방 목록으로 이동
-- 방장 퇴장 전 클라이언트에서 확인 모달 권장
+- 방장 자발적 퇴장 전 클라이언트에서 확인 모달 권장
 
 ---
 
@@ -1285,7 +1372,7 @@ client.subscribe('/user/queue/errors', (message) => {
 | `DISCONNECTING` | 연결 종료 중 |
 | `DISCONNECTED` | 연결 끊김 |
 
-### 8.2 Heartbeat
+### 8.2 Heartbeat 설정
 ```javascript
 const client = new Client({
   brokerURL: 'ws://localhost:9000/ws',
@@ -1294,21 +1381,188 @@ const client = new Client({
 });
 ```
 
-### 8.3 재연결 전략
+**서버 설정:**
+```java
+// WebSocketConfig.java
+@Override
+public void configureMessageBroker(MessageBrokerRegistry registry) {
+    registry.enableSimpleBroker("/topic", "/queue")
+        .setHeartbeatValue(new long[]{10000, 10000});  // [서버→클라이언트, 클라이언트→서버]
+}
+```
+
+**타임아웃 계산:**
+- Heartbeat가 2회 연속 누락되면 연결 해제로 간주
+- 실제 타임아웃: heartbeatIncoming * 2 = 20초
+
+### 8.3 연결 해제 감지
+
+**클라이언트 측:**
 ```javascript
 const client = new Client({
   brokerURL: 'ws://localhost:9000/ws',
-  reconnectDelay: 5000,  // 5초 후 재연결
   
-  onWebSocketClose: () => {
-    console.log('WebSocket closed');
+  onWebSocketClose: (event) => {
+    console.log('WebSocket 연결 종료:', event.code, event.reason);
+    
+    // 정상 종료가 아닌 경우
+    if (event.code !== 1000) {
+      handleUnexpectedDisconnect();
+    }
   },
   
   onWebSocketError: (error) => {
-    console.error('WebSocket error:', error);
+    console.error('WebSocket 에러:', error);
   },
+  
+  onStompError: (frame) => {
+    console.error('STOMP 에러:', frame.headers, frame.body);
+  }
+});
+
+// 비정상 종료 처리
+function handleUnexpectedDisconnect() {
+  // 사용자에게 알림
+  showNotification('연결이 끊어졌습니다. 재연결을 시도합니다...');
+  
+  // 재연결은 자동으로 시도됨 (reconnectDelay 설정 시)
+}
+```
+
+**서버 측:**
+```java
+@EventListener
+public void handleSessionConnect(SessionConnectEvent event) {
+    StompHeaderAccessor accessor = StompHeaderAccessor.wrap(event.getMessage());
+    String sessionId = accessor.getSessionId();
+    
+    log.info("WebSocket 연결: sessionId={}", sessionId);
+}
+
+@EventListener
+public void handleSessionDisconnect(SessionDisconnectEvent event) {
+    StompHeaderAccessor accessor = StompHeaderAccessor.wrap(event.getMessage());
+    String sessionId = accessor.getSessionId();
+    CloseStatus closeStatus = accessor.getCloseStatus();
+    
+    log.info("WebSocket 연결 해제: sessionId={}, status={}", 
+             sessionId, closeStatus);
+    
+    // 사용자 정보 조회
+    Long userId = (Long) accessor.getSessionAttributes().get("userId");
+    Long gameRoomId = (Long) accessor.getSessionAttributes().get("gameRoomId");
+    
+    // 방에 참여 중이었다면 자동 퇴장 처리
+    if (userId != null && gameRoomId != null) {
+        quizService.handleDisconnect(gameRoomId, userId);
+    }
+}
+```
+
+### 8.4 재연결 전략
+
+**기본 재연결:**
+```javascript
+const client = new Client({
+  brokerURL: 'ws://localhost:9000/ws',
+  reconnectDelay: 5000,  // 5초 후 재연결 시도
+  
+  // 최대 재연결 시도 횟수 (0 = 무제한)
+  maxReconnectAttempts: 5,
+  
+  onConnect: (frame) => {
+    console.log('연결 성공');
+    
+    // 재연결 시 방 상태 복구
+    const lastRoomId = sessionStorage.getItem('currentRoomId');
+    if (lastRoomId) {
+      attemptRejoin(lastRoomId);
+    }
+  }
 });
 ```
+
+**재입장 로직:**
+```javascript
+async function attemptRejoin(gameRoomId) {
+  try {
+    // 방 상태 확인 (REST API)
+    const response = await axios.get(`/api/quiz/rooms/${gameRoomId}`);
+    
+    // WAITING 상태인 경우에만 재입장 허용
+    if (response.data.data.status === 'WAITING') {
+      client.publish({
+        destination: `/app/room/${gameRoomId}/join`,
+        body: JSON.stringify({ gameRoomId })
+      });
+    } else {
+      // 이미 시작된 방이면 방 목록으로 이동
+      showNotification('게임이 이미 시작되어 재입장할 수 없습니다.');
+      navigate('/quiz/rooms');
+    }
+  } catch (error) {
+    // 방이 삭제되었거나 접근 불가
+    showNotification('방을 찾을 수 없습니다.');
+    navigate('/quiz/rooms');
+  }
+}
+```
+
+**지수 백오프 (선택적):**
+```javascript
+let reconnectAttempts = 0;
+
+const client = new Client({
+  brokerURL: 'ws://localhost:9000/ws',
+  
+  reconnectDelay: () => {
+    reconnectAttempts++;
+    // 5초, 10초, 20초, 40초, ... (최대 60초)
+    return Math.min(5000 * Math.pow(2, reconnectAttempts - 1), 60000);
+  },
+  
+  onConnect: () => {
+    reconnectAttempts = 0;  // 성공 시 리셋
+  }
+});
+```
+
+### 8.5 브라우저 탭 닫기 감지
+```javascript
+// beforeunload 이벤트로 탭 닫기 감지
+window.addEventListener('beforeunload', (event) => {
+  if (client && client.connected && currentRoomId) {
+    // 방 퇴장 메시지 전송 (비동기)
+    client.publish({
+      destination: `/app/room/${currentRoomId}/leave`,
+      body: JSON.stringify({ gameRoomId: currentRoomId })
+    });
+    
+    // WebSocket 연결 즉시 종료
+    client.deactivate();
+  }
+});
+
+// visibilitychange로 탭 전환 감지 (선택적)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    console.log('탭이 백그라운드로 전환됨');
+  } else {
+    console.log('탭이 포어그라운드로 전환됨');
+    
+    // 연결 상태 확인
+    if (client && !client.connected) {
+      console.log('연결이 끊어져 재연결 시도');
+      client.activate();
+    }
+  }
+});
+```
+
+**주의사항:**
+- `beforeunload`는 브라우저에 따라 동작이 다를 수 있음
+- 모바일에서는 제한적으로 작동
+- 서버 측 타임아웃이 주요 방어선
 
 ---
 
