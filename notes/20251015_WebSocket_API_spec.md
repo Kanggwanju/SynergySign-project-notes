@@ -123,18 +123,18 @@ import { Client } from '@stomp/stompjs';
 
 const client = new Client({
   brokerURL: 'ws://localhost:9000/ws',
-  
+
   debug: (str) => {
     console.log('STOMP:', str);
   },
-  
+
   onConnect: (frame) => {
     console.log('Connected:', frame);
-    
+
     // 방 입장
     joinRoom(gameRoomId);
   },
-  
+
   onStompError: (frame) => {
     console.error('STOMP Error:', frame);
   },
@@ -165,8 +165,8 @@ client.activate();
 ```java
 // WebSocketSecurityConfig.java 기반
 - /app/** 전송(SEND): 인증 필요 ✅
-- /topic/**, /queue/** 구독(SUBSCRIBE): 인증 필요 ✅
-- 그 외 메시지: 거부 ❌
+ - /topic/**, /queue/** 구독(SUBSCRIBE): 인증 필요 ✅
+ - 그 외 메시지: 거부 ❌
 ```
 
 ---
@@ -382,10 +382,7 @@ client.activate();
 **[Client → Server]**
 ```
 SEND /app/room/{gameRoomId}/join
-
-{
-  "gameRoomId": 123
-}
+// 본문 없음 (gameRoomId는 경로 변수로 전달)
 ```
 
 **[Server → Client]** (입장자 개인)
@@ -467,15 +464,12 @@ SUBSCRIBE /topic/room/{gameRoomId}/participant
 **[Client → Server]**
 ```
 SEND /app/room/{gameRoomId}/leave
-
-{
-  "gameRoomId": 123
-}
+// 본문 없음 (gameRoomId는 경로 변수로 전달)
 ```
 
 **[Server → Room]**
 ```
-SEND /topic/room/{gameRoomId}/participant
+SUBSCRIBE /topic/room/{gameRoomId}/participant
 
 {
   "success": true,
@@ -483,10 +477,15 @@ SEND /topic/room/{gameRoomId}/participant
   "timestamp": "2025-10-15T14:30:00",
   "data": {
     "eventType": "PARTICIPANT_LEFT",
-    "userId": 101,
-    "nickname": "user456",
-    "reason": "MANUAL",
-    "currentParticipants": 2
+    "participant": {
+      "userId": 101,
+      "nickname": "user456",
+      "profileImageUrl": "https://...",
+      "isHost": false,
+      "isReady": false
+    },
+    "currentParticipants": 2,
+    "roomId": 123
   }
 }
 ```
@@ -526,18 +525,23 @@ public void handleWebSocketDisconnect(SessionDisconnectEvent event) {
 
 **[Server → Room]**
 ```
-SEND /topic/room/{gameRoomId}/participant
+SUBSCRIBE /topic/room/{gameRoomId}/participant
 
 {
   "success": true,
-  "message": "참가자의 연결이 끊어졌습니다.",
+  "message": "사용자의 연결이 끊어졌습니다.",
   "timestamp": "2025-10-15T14:30:00",
   "data": {
     "eventType": "PARTICIPANT_LEFT",
-    "userId": 101,
-    "nickname": "user456",
-    "reason": "CONNECTION_LOST",
-    "currentParticipants": 2
+    "participant": {
+      "userId": 101,
+      "nickname": "user456",
+      "profileImageUrl": "https://...",
+      "isHost": false,
+      "isReady": false
+    },
+    "currentParticipants": 2,
+    "roomId": 123
   }
 }
 ```
@@ -1564,6 +1568,41 @@ document.addEventListener('visibilitychange', () => {
 - 모바일에서는 제한적으로 작동
 - 서버 측 타임아웃이 주요 방어선
 
+### 8.6 WS 세션 가드 API (단일 탭 강제)
+클라이언트는 방 페이지 진입 전에 HTTP 가드 API를 호출하여, 현재 사용자가 이미 활성 WebSocket 세션을 보유 중인지 확인합니다. 활성 세션이 존재하면 새 탭 진입을 차단하고 안내합니다.
+
+- 엔드포인트: `GET /api/ws/session/active`
+- 인증: 필요(JWT/세션 쿠키)
+- 응답 포맷: `ApiResponse<WsSessionStatusResponse>`
+
+응답 스키마(data):
+```json
+{
+  "active": true,
+  "reason": "ACTIVE_SESSION_EXISTS"
+}
+```
+
+- `active`: 활성 WebSocket 세션 존재 여부(boolean)
+- `reason`: "ACTIVE_SESSION_EXISTS" | "NONE"
+
+샘플 성공 응답:
+```json
+{
+  "success": true,
+  "message": "WS 세션 활성 여부",
+  "timestamp": "2025-10-16T15:45:12.345",
+  "data": {
+    "active": false,
+    "reason": "NONE"
+  }
+}
+```
+
+프론트 권장 흐름:
+1) 방 라우트 진입 가드에서 호출 → `active=true`면 진입 차단 및 리다이렉트
+2) 가드 통과 시에만 STOMP CONNECT/구독 수행
+
 ---
 
 ## 9. 시퀀스 다이어그램
@@ -1731,72 +1770,72 @@ function QuizRoom() {
   const [questions, setQuestions] = useState([]);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [currentChallengeOrder, setCurrentChallengeOrder] = useState(null);
-  
+
   // 1. 방 생성 (REST API)
   const createRoom = async (gameTitle) => {
     try {
       const response = await axios.post(
-        '/api/quiz/rooms',
-        { gameTitle },
-        { withCredentials: true }
+          '/api/quiz/rooms',
+          { gameTitle },
+          { withCredentials: true }
       );
-      
+
       const gameRoomId = response.data.data.gameRoomId;
       connectWebSocket(gameRoomId);
     } catch (error) {
       console.error('방 생성 실패:', error);
     }
   };
-  
+
   // 2. WebSocket 연결 및 방 입장
   const connectWebSocket = (gameRoomId) => {
     const stompClient = new Client({
       brokerURL: 'ws://localhost:9000/ws',
-      
+
       onConnect: () => {
         console.log('WebSocket 연결 성공');
-        
+
         // 에러 구독
         stompClient.subscribe('/user/queue/errors', handleError);
-        
+
         // 방 참여자 업데이트 구독
         stompClient.subscribe(
-          `/topic/room/${gameRoomId}/participant`, 
-          handleParticipantUpdate
+            `/topic/room/${gameRoomId}/participant`,
+            handleParticipantUpdate
         );
-        
+
         // 퀴즈 이벤트 구독
         stompClient.subscribe(
-          `/topic/room/${gameRoomId}/quiz`, 
-          handleQuizEvent
+            `/topic/room/${gameRoomId}/quiz`,
+            handleQuizEvent
         );
-        
+
         // WebRTC 시그널링 구독
         stompClient.subscribe(
-          '/user/queue/webrtc',
-          handleWebRTCSignaling
+            '/user/queue/webrtc',
+            handleWebRTCSignaling
         );
-        
+
         // 방 입장
         stompClient.publish({
           destination: `/app/room/${gameRoomId}/join`,
           body: JSON.stringify({ gameRoomId })
         });
       },
-      
+
       onStompError: (frame) => {
         console.error('STOMP 에러:', frame);
       }
     });
-    
+
     stompClient.activate();
     setClient(stompClient);
   };
-  
+
   // 3. 에러 핸들러
   const handleError = (message) => {
     const error = JSON.parse(message.body);
-    
+
     switch (error.error) {
       case 'UNAUTHORIZED':
         window.location.href = '/login';
@@ -1811,98 +1850,98 @@ function QuizRoom() {
         console.error('에러:', error);
     }
   };
-  
+
   // 4. 참여자 업데이트 핸들러
   const handleParticipantUpdate = (message) => {
     const response = JSON.parse(message.body);
-    
+
     switch (response.data.eventType) {
       case 'PARTICIPANT_JOINED':
         console.log('새 참가자:', response.data.participant);
         break;
-        
+
       case 'PARTICIPANT_LEFT':
         console.log('참가자 퇴장:', response.data.userId);
         break;
-        
+
       case 'ROOM_CLOSED':
         // 방 폐쇄 처리
         handleRoomClosed(response);
         break;
     }
   };
-  
+
   // 방 폐쇄 핸들러
   const handleRoomClosed = (response) => {
     // 1. WebSocket 연결 종료
     client?.deactivate();
-    
+
     // 2. 사용자 알림 (optional)
     alert(response.message);
-    
+
     // 3. 방 목록으로 리다이렉트
     window.location.href = '/quiz/rooms';
   };
-  
+
   // 5. 퀴즈 이벤트 핸들러
   const handleQuizEvent = (message) => {
     const response = JSON.parse(message.body);
-    
+
     switch (response.data.eventType) {
       case 'QUIZ_STARTED':
         // 8개 문제 저장
         setQuestions(response.data.questions);
         setCurrentQuestionIndex(0);
-        
+
         // 3초 후 첫 번째 문제 출제
         setTimeout(() => {
           issueQuestion(response.data.questions[0]);
         }, 3000);
         break;
-        
+
       case 'CHALLENGE_ACQUIRED':
         console.log(`${response.data.nickname}님 도전!`);
-        
+
         // 내가 도전권을 얻었다면 challengeOrder 저장
         if (response.data.userId === currentUserId) {
           setCurrentChallengeOrder(response.data.challengeOrder);
         }
         break;
-        
+
       case 'ANSWER_RESULT':
         console.log('결과:', response.data.isCorrect ? '정답' : '오답');
         console.log(`도전 순서: ${response.data.challengeOrder}등`);
-        
+
         // challengeOrder 초기화
         setCurrentChallengeOrder(null);
-        
+
         // 다음 문제로 진행
         goToNextQuestion();
         break;
-        
+
       case 'QUIZ_FINISHED':
         console.log('퀴즈 종료:', response.data.finalRanking);
         break;
     }
   };
-  
+
   // 6. 문제 출제 (클라이언트 주도)
   const issueQuestion = (question) => {
     console.log('문제 출제:', question);
-    
+
     // UI에 문제 표시
     // - question.title: 단어
     // - question.quizWordId: 비디오 URL 추론에 사용
     // - question.questionNumber: 문제 번호
   };
-  
+
   // 7. 다음 문제로 진행
   const goToNextQuestion = () => {
     const nextIndex = currentQuestionIndex + 1;
-    
+
     if (nextIndex < questions.length) {
       setCurrentQuestionIndex(nextIndex);
-      
+
       // 3초 대기 후 다음 문제
       setTimeout(() => {
         issueQuestion(questions[nextIndex]);
@@ -1912,7 +1951,7 @@ function QuizRoom() {
       console.log('모든 문제 완료');
     }
   };
-  
+
   // 8. 정답 도전하기
   const handleChallenge = (quizWordId, questionNumber) => {
     if (client && roomData) {
@@ -1922,31 +1961,31 @@ function QuizRoom() {
       });
     }
   };
-  
+
   // 9. AI 판정 후 결과 제출
   const submitQuizResult = async (quizWordId, questionNumber, isCorrect) => {
     if (!currentChallengeOrder) {
       console.error('도전 순서가 없습니다. 먼저 정답 도전하기 버튼을 눌러주세요.');
       return;
     }
-    
+
     if (client && roomData) {
       client.publish({
         destination: `/app/room/${roomData.gameRoomId}/quiz/result`,
-        body: JSON.stringify({ 
-          quizWordId, 
-          questionNumber, 
+        body: JSON.stringify({
+          quizWordId,
+          questionNumber,
           challengeOrder: currentChallengeOrder,
-          isCorrect 
+          isCorrect
         })
       });
     }
   };
-  
+
   // 10. WebRTC 시그널링 핸들러
   const handleWebRTCSignaling = (message) => {
     const response = JSON.parse(message.body);
-    
+
     switch (response.data.eventType) {
       case 'WEBRTC_OFFER':
         // Offer 처리
@@ -1959,52 +1998,52 @@ function QuizRoom() {
         break;
     }
   };
-  
+
   // 11. 방 퇴장 (자발적)
   const leaveRoom = () => {
     if (!client || !roomData) return;
-    
+
     // 방장인 경우 확인 모달
     const isHost = roomData.participants.some(
-      p => p.isHost && p.userId === currentUserId
+        p => p.isHost && p.userId === currentUserId
     );
-    
+
     if (isHost) {
       const confirmed = window.confirm(
-        '방장이 퇴장하면 방이 종료됩니다. 계속하시겠습니까?'
+          '방장이 퇴장하면 방이 종료됩니다. 계속하시겠습니까?'
       );
       if (!confirmed) return;
     }
-    
+
     // 퇴장 메시지 전송
     client.publish({
       destination: `/app/room/${roomData.gameRoomId}/leave`,
       body: JSON.stringify({ gameRoomId: roomData.gameRoomId })
     });
-    
+
     // WebSocket 연결 종료
     client.deactivate();
-    
+
     // 방 목록으로 이동
     window.location.href = '/quiz/rooms';
   };
-  
+
   // 12. 정리
   useEffect(() => {
     return () => {
       client?.deactivate();
     };
   }, [client]);
-  
+
   return (
-    <div>
-      <button onClick={() => createRoom('테스트 방')}>
-        방 생성
-      </button>
-      <button onClick={leaveRoom}>
-        방 나가기
-      </button>
-    </div>
+      <div>
+        <button onClick={() => createRoom('테스트 방')}>
+          방 생성
+        </button>
+        <button onClick={leaveRoom}>
+          방 나가기
+        </button>
+      </div>
   );
 }
 ```
