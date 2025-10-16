@@ -459,179 +459,113 @@ SUBSCRIBE /topic/room/{gameRoomId}/participant
 
 ### 6.2 방 퇴장
 
-#### 6.2.1 자발적 퇴장 (일반 참가자)
+#### 6.2.1 퇴장 방법
 
-**[Client → Server]**
-```
-SEND /app/room/{gameRoomId}/leave
-// 본문 없음 (gameRoomId는 경로 변수로 전달)
-```
-
-**[Server → Room]**
-```
-SUBSCRIBE /topic/room/{gameRoomId}/participant
-
-{
-  "success": true,
-  "message": "참가자가 퇴장했습니다.",
-  "timestamp": "2025-10-15T14:30:00",
-  "data": {
-    "eventType": "PARTICIPANT_LEFT",
-    "participant": {
-      "userId": 101,
-      "nickname": "user456",
-      "profileImageUrl": "https://...",
-      "isHost": false,
-      "isReady": false
-    },
-    "currentParticipants": 2,
-    "roomId": 123
-  }
-}
-```
-
-#### 6.2.2 비자발적 퇴장 (연결 해제)
-
-**상황:**
-- 인터넷 연결 끊김
-- 브라우저 탭 닫기
-- 네트워크 타임아웃
-- 클라이언트 충돌
-
-**서버 감지 메커니즘:**
-```java
-@EventListener
-public void handleWebSocketDisconnect(SessionDisconnectEvent event) {
-    StompHeaderAccessor accessor = StompHeaderAccessor.wrap(event.getMessage());
-    String sessionId = accessor.getSessionId();
-    
-    // 세션에서 사용자 정보 조회
-    Long userId = getUserIdFromSession(sessionId);
-    Long gameRoomId = getGameRoomIdFromSession(sessionId);
-    
-    if (userId != null && gameRoomId != null) {
-        // 자동 퇴장 처리
-        handleAutoLeave(gameRoomId, userId, "CONNECTION_LOST");
-    }
-}
-```
-
-**타임아웃 설정:**
-| 항목 | 시간 | 설명 |
-|------|------|------|
-| Heartbeat Timeout | 20초 | Heartbeat 미수신 시 연결 해제 |
-| Session Timeout | 30초 | 세션 비활성 시 자동 정리 |
-| Reconnect Grace Period | 5초 | 재연결 유예 시간 (선택적) |
-
-**[Server → Room]**
-```
-SUBSCRIBE /topic/room/{gameRoomId}/participant
-
-{
-  "success": true,
-  "message": "사용자의 연결이 끊어졌습니다.",
-  "timestamp": "2025-10-15T14:30:00",
-  "data": {
-    "eventType": "PARTICIPANT_LEFT",
-    "participant": {
-      "userId": 101,
-      "nickname": "user456",
-      "profileImageUrl": "https://...",
-      "isHost": false,
-      "isReady": false
-    },
-    "currentParticipants": 2,
-    "roomId": 123
-  }
-}
-```
-
-**재연결 처리 (선택적):**
+**클라이언트 동작:**
 ```javascript
-const client = new Client({
-  brokerURL: 'ws://localhost:9000/ws',
-  reconnectDelay: 5000,
-  
-  onWebSocketClose: () => {
-    console.log('연결 끊김 - 5초 후 재연결 시도');
-  },
-  
-  onConnect: () => {
-    // 재연결 성공 시 자동으로 방 재입장
-    const lastRoomId = localStorage.getItem('lastRoomId');
-    if (lastRoomId) {
-      rejoinRoom(lastRoomId);
-    }
-  }
-});
+// 퇴장 버튼 클릭 시 WebSocket 연결만 종료
+stompClient.deactivate();
+navigate('/quiz/rooms');
 ```
 
-**재입장 제한:**
-- 퀴즈가 이미 시작된 경우 재입장 불가
-- 방이 삭제된 경우 재입장 불가
-- 대기실 상태인 경우에만 재입장 허용
+**서버 자동 처리:**
+- `SessionDisconnectEvent` 감지
+- DB에서 참가자 제거
+- 방 인원수 감소
+- 세션 정리
+- 남은 참가자들에게 알림 전송
+
+---
+
+#### 6.2.2 퇴장 알림
+
+**[Server → Room]**
+```
+SEND /topic/room/{gameRoomId}/participant
+
+{
+  "success": true,
+  "message": "사용자가 연결을 끊었습니다.",
+  "data": {
+    "eventType": "PARTICIPANT_LEFT",
+    "participant": {
+      "userId": 101,
+      "nickname": "user456",
+      "profileUrl": "https://example.com/profile.jpg",
+      "isHost": false
+    },
+    "currentParticipants": 2,
+    "roomId": 123
+  }
+}
+```
+
+**클라이언트 처리:**
+```javascript
+if (response.data.eventType === 'PARTICIPANT_LEFT') {
+  const { participant, currentParticipants } = response.data;
+  
+  removeParticipantFromUI(participant.userId);
+  updateParticipantCount(currentParticipants);
+  toast.info(`${participant.nickname}님이 퇴장했습니다.`);
+  
+  // 방장이 나간 경우
+  if (participant.isHost) {
+    toast.warning('방장이 퇴장하여 방이 종료되었습니다.');
+    stompClient.deactivate();
+    navigate('/quiz/rooms');
+  }
+}
+```
+
+---
 
 #### 6.2.3 방장 퇴장 (방 종료)
 
-**[Client → Server]** (자발적 또는 비자발적)
-```
-SEND /app/room/{gameRoomId}/leave
+**동작:**
+- 방장 퇴장 시 **방이 즉시 종료**됨
+- 모든 참가자가 자동으로 방 목록으로 이동
+- 방장 승계 기능 없음
 
-{
-  "gameRoomId": 123
-}
-```
-
-**[Server → Room]** (모든 참여자)
+**[Server → Room]** (방장 퇴장 시)
 ```
 SEND /topic/room/{gameRoomId}/participant
 
 {
   "success": true,
   "message": "방장이 퇴장하여 방이 종료되었습니다.",
-  "timestamp": "2025-10-15T14:30:00",
   "data": {
     "eventType": "ROOM_CLOSED",
-    "reason": "HOST_LEFT",  // 또는 "HOST_DISCONNECTED"
-    "hostNickname": "user123",
-    "redirectTo": "/quiz/rooms"
+    "participant": {
+      "userId": 100,
+      "nickname": "host123",
+      "isHost": true
+    },
+    "currentParticipants": 0,
+    "roomId": 123,
+    "roomClosed": true
   }
 }
 ```
 
-**서버 처리 로직:**
-1. GameRoom 상태를 `FINISHED`로 변경
-2. 모든 GameParticipant 삭제
-3. 메모리 캐시(HashMap) 정리
-4. 남은 참가자들에게 `ROOM_CLOSED` 이벤트 발송
-
-**클라이언트 처리:**
-```typescript
-case 'ROOM_CLOSED':
-  // 1. WebSocket 연결 종료
-  client?.deactivate();
-  
-  // 2. 사용자 알림
-  const message = data.reason === 'HOST_DISCONNECTED' 
-    ? '방장의 연결이 끊어져 방이 종료되었습니다.'
-    : '방장이 퇴장하여 방이 종료되었습니다.';
-  toast.warning(message);
-  
-  // 3. 방 목록으로 자동 리다이렉트
-  navigate('/quiz/rooms');
-  break;
+**방장 퇴장 전 확인 권장:**
+```javascript
+if (confirm('방을 나가시면 방이 종료됩니다. 계속하시겠습니까?')) {
+  stompClient.deactivate();
+}
 ```
 
-**reason 값:**
-| 값 | 설명 |
-|-----|------|
-| `HOST_LEFT` | 방장이 자발적으로 퇴장 |
-| `HOST_DISCONNECTED` | 방장의 연결이 끊김 |
+---
 
-**특이사항:**
-- 방장이 퇴장(자발적/비자발적)하면 **방이 즉시 종료**됨 (방장 승계 없음)
-- 남은 참가자들은 자동으로 방 목록으로 이동
-- 방장 자발적 퇴장 전 클라이언트에서 확인 모달 권장
+#### 6.2.4 비정상 종료
+
+**상황:**
+- 브라우저 닫기
+- 네트워크 끊김
+- 탭 새로고침
+
+**처리:**
+서버가 자동으로 감지하여 6.2.2와 동일하게 처리됨 (추가 작업 불필요)
 
 ---
 
