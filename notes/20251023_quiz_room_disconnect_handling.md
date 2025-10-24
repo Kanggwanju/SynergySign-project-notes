@@ -59,21 +59,38 @@
 
 ## 현재 구현 상황
 
-### ✅ 완료된 기능
+### ✅ 완료된 기능 (2025-10-24 기준)
 
+#### 백엔드
+- WebSocketEventsListener의 `onDisconnect` 메서드로 연결 끊김 자동 감지
+- 방장 연결 끊김 시 방 전체 삭제 및 브로드캐스팅
+- 참가자 연결 끊김 시 해당 참가자만 삭제 및 브로드캐스팅
+- 3가지 경로로 방 종료 알림 전송 (`/user/queue/room-closed`, `ROOM_CLOSED`, `PARTICIPANT_LEFT`)
+
+#### 프론트엔드 - 대기방
 - WebSocket 연결 및 방 입장
 - Janus WebRTC 연결 (P2P 영상 통신)
 - 웹캠 관리 (useWebcam hook)
 - 준비 상태 관리
 - 참가자 입장/퇴장 이벤트 처리
+- **나가기 버튼 및 확인 모달**
+- **방 종료 시 AlertModal 표시 (방장 퇴장 감지)**
+- **리소스 정리 공통 함수 (`cleanupAndExit`)**
+- **3가지 경로로 방 종료 알림 수신 처리**
+- **중복 코드 리팩토링 완료 (100줄 → 51줄, 49% 감소)**
 
 ### ⚠️ 미구현 영역
 
-- 비정상 종료 시 리소스 정리
-- 탭 닫기/새로고침 감지
+#### 대기방
+- 탭 닫기/새로고침 감지 (beforeunload 이벤트)
 - 네트워크 끊김 감지 및 재연결
-- 방장 위임 로직
+- 뒤로가기 버튼 처리
+- 방장 위임 로직 (현재는 방 종료)
+
+#### 게임 페이지
+- 나가기 버튼 (팀원 작업 대기)
 - 게임 중 연결 해제 처리
+- 게임 중 방장 나가기 처리
 
 ---
 
@@ -124,40 +141,68 @@
 
 ### 1. 정상 종료 처리
 
-#### 1.1 나가기 버튼 클릭
+#### 1.1 나가기 버튼 클릭 ✅ 구현 완료
+
+**구현 코드 (QuizWaitingRoom.jsx):**
 
 ```javascript
-const handleConfirmExit = async () => {
+// 방 나가기 공통 처리 함수
+const cleanupAndExit = async () => {
   try {
-    // 1. WebSocket으로 방 나가기 전송 (정상 퇴장 알림)
-    // 서버에서 DB 정리 + 다른 참가자에게 브로드캐스팅
-    websocketService.leaveRoom(Number(roomId));
+    console.log('🚪 방 나가기 처리 시작');
 
-    // 2. Janus WebRTC 정리 (클라이언트 리소스)
-    cleanupJanus();
+    // 1. Janus WebRTC 정리
+    if (janusRef.current) {
+      janusRef.current.destroy();
+      janusRef.current = null;
+      pluginHandleRef.current = null;
+      remoteFeedsRef.current = {};
+      userIdToFeedIdRef.current = {};
+      setIsJanusConnected(false);
+    }
 
-    // 3. 웹캠 정리 (클라이언트 리소스)
-    stopWebcam();
+    // 2. 웹캠 정리
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
+    }
 
-    // 4. WebSocket 연결 해제
+    // 3. WebSocket 연결 해제
+    // ⚠️ 중요: 연결 해제 시 서버의 onDisconnect가 자동 감지
+    // → DB 정리 + 다른 참가자에게 브로드캐스팅 자동 처리
     websocketService.disconnect();
 
-    // 5. 메인 페이지로 이동
-    navigate("/main");
+    // 4. 메인 페이지로 이동
+    navigate('/main');
   } catch (error) {
-    console.error("방 나가기 실패:", error);
-    // 에러가 있어도 강제로 메인으로 이동
-    // 서버는 WebSocket 연결 끊김을 감지하여 자동 처리
-    navigate("/main");
+    console.error('❌ 방 나가기 실패:', error);
+    navigate('/main');
   }
+};
+
+// 나가기 버튼 클릭
+const handleExit = () => {
+  setShowExitModal(true);
+};
+
+// 나가기 확인
+const confirmExit = () => {
+  cleanupAndExit();
 };
 ```
 
 **💡 동작 흐름:**
 
-1. 클라이언트: `leaveRoom` 메시지 전송
-2. 서버: 메시지 수신 → DB 처리 → 브로드캐스팅
-3. 클라이언트: 리소스 정리 후 페이지 이동
+1. 사용자: 나가기 버튼 클릭
+2. 클라이언트: 확인 모달 표시
+3. 사용자: 확인 버튼 클릭
+4. 클라이언트: `cleanupAndExit()` 호출 → 리소스 정리 → WebSocket 연결 해제
+5. 서버: `onDisconnect` 메서드가 연결 끊김 감지 → DB 정리 → 브로드캐스팅
+6. 클라이언트: 메인 페이지로 이동
+
+**🎯 설계 결정:**
+- WebSocket 연결 해제만으로 서버가 자동 처리하도록 설계
+- 별도의 `leaveRoom` 메시지 전송 불필요
+- 클라이언트는 로컬 리소스 정리에만 집중
 
 #### 1.2 뒤로가기 버튼
 
@@ -297,8 +342,8 @@ useEffect(() => {
 2. 클라이언트: 2회(4초) 재연결 시도
 3. **성공**: 방에 재입장 → 정상 진행
 4. **실패**:
-    - 서버는 이미 `WebSocketEventsListener`에서 퇴장 처리 완료
-    - 클라이언트는 리소스 정리 후 메인으로 이동
+   - 서버는 이미 `WebSocketEventsListener`에서 퇴장 처리 완료
+   - 클라이언트는 리소스 정리 후 메인으로 이동
 
 **⚠️ 재연결 시 주의사항:**
 
@@ -512,96 +557,137 @@ const handleError = (data) => {
 
 1. **중복 탭 접속 (같은 방)**
 
-    - 백엔드: 중복 입장 허용 (같은 방이므로 문제없음)
-    - 프론트: WebSocket 세션 체크로 차단 (권장)
-    - 결과: 안전하게 차단됨
+   - 백엔드: 중복 입장 허용 (같은 방이므로 문제없음)
+   - 프론트: WebSocket 세션 체크로 차단 (권장)
+   - 결과: 안전하게 차단됨
 
 2. **다른 방 참여 중 URL 접근**
 
-    - 백엔드: `PARTICIPANT_ALREADY_IN_ROOM` 예외 발생
-    - 프론트: 에러 메시지 표시 후 메인으로 이동
-    - 결과: 완벽하게 차단됨
+   - 백엔드: `PARTICIPANT_ALREADY_IN_ROOM` 예외 발생
+   - 프론트: 에러 메시지 표시 후 메인으로 이동
+   - 결과: 완벽하게 차단됨
 
 3. **비참여 방 URL 강제 접근**
 
-    - 백엔드: 정상 입장 처리 (새 참가자로 추가)
-    - 프론트: 정상 입장
-    - 결과: 정상 동작 (문제없음)
+   - 백엔드: 정상 입장 처리 (새 참가자로 추가)
+   - 프론트: 정상 입장
+   - 결과: 정상 동작 (문제없음)
 
 4. **WebSocket 중복 연결**
-    - 백엔드: `UserSessionRegistry`가 기존 세션 유지
-    - 프론트: 세션 체크로 사전 차단
-    - 결과: 안전하게 차단됨
+   - 백엔드: `UserSessionRegistry`가 기존 세션 유지
+   - 프론트: 세션 체크로 사전 차단
+   - 결과: 안전하게 차단됨
 
-#### 4.2 방장 나가기 처리
+#### 4.2 방장 나가기 처리 ✅ 구현 완료
 
 **🎯 서버 로직:**
 
-- 방장 연결 끊김 → DB에서 방 인원 전체 삭제 → 브로드캐스팅
-- 참가자들은 `PARTICIPANT_LEFT` 이벤트에서 `roomClosed: true` 수신
+- 방장 연결 끊김 → DB에서 방 인원 전체 삭제 → 3가지 경로로 브로드캐스팅
+- 참가자들은 여러 경로로 방 종료 알림 수신
+
+**구현 코드 (QuizWaitingRoom.jsx):**
 
 ```javascript
-// handleParticipantEvent 함수 내부 (이미 구현됨)
-case 'PARTICIPANT_LEFT':
-  console.log('👋 참가자 퇴장:', eventData.participant);
+// 방 종료 이벤트 핸들러 (경로 1: /user/queue/room-closed)
+const handleRoomClosed = (data) => {
+  console.log('📥 방 종료 알림:', data);
+  setShowRoomClosedAlert(true);
+};
 
-  // 방장이 나가서 방이 종료된 경우
-  if (eventData.roomClosed) {
-    showAlert('방장이 나가서 방이 종료되었습니다.', '방 종료', 'info');
+// WebSocket 이벤트 리스너 등록
+useEffect(() => {
+  const initWebSocket = async () => {
+    try {
+      websocketService.on('room:join', handleRoomJoin);
+      websocketService.on('participant', handleParticipantEvent);
+      websocketService.on('room:closed', handleRoomClosed); // ✅ 추가
+      websocketService.on('error', handleError);
 
-    // 리소스 정리
-    cleanupJanus();
-    stopWebcam();
-    websocketService.disconnect();
-
-    setTimeout(() => {
-      navigate('/main');
-    }, 2000);
-    return;
-  }
-
-  // 일반 참가자가 나간 경우
-  setParticipants(prev =>
-    prev.filter(p => p.userId !== eventData.participant.userId)
-  );
-  setRoomInfo(prev => ({
-    ...prev,
-    currentParticipants: eventData.currentParticipants
-  }));
-
-  // 방장 위임 로직 (서버에서 처리하는 경우)
-  // 서버가 방장 위임을 지원한다면 아래 코드 추가
-  if (eventData.newHostId) {
-    setRoomInfo(prev => ({
-      ...prev,
-      hostId: eventData.newHostId
-    }));
-
-    setParticipants(prev => prev.map(p => ({
-      ...p,
-      isHost: p.userId === eventData.newHostId
-    })));
-
-    if (eventData.newHostId === myUserId) {
-      showAlert('당신이 새로운 방장이 되었습니다.', '방장 위임', 'info');
+      await websocketService.connect();
+      websocketService.joinRoom(Number(roomId));
+    } catch (error) {
+      console.error('❌ WebSocket 연결 실패:', error);
     }
+  };
+
+  initWebSocket();
+
+  return () => {
+    websocketService.off('room:join', handleRoomJoin);
+    websocketService.off('participant', handleParticipantEvent);
+    websocketService.off('room:closed', handleRoomClosed); // ✅ 추가
+    websocketService.off('error', handleError);
+  };
+}, [roomId]);
+
+// 참가자 이벤트 핸들러
+const handleParticipantEvent = (data) => {
+  if (!data.success) return;
+  const eventData = data.data;
+
+  switch (eventData.eventType) {
+    // 경로 2: ROOM_CLOSED 이벤트 타입
+    case 'ROOM_CLOSED':
+      console.log('🚪 방 종료:', eventData);
+      setShowRoomClosedAlert(true);
+      break;
+
+    // 경로 3: PARTICIPANT_LEFT + roomClosed 플래그
+    case 'PARTICIPANT_LEFT':
+      console.log('👋 참가자 퇴장:', eventData.participant);
+      if (eventData.roomClosed) {
+        setShowRoomClosedAlert(true);
+        return;
+      }
+      // 일반 참가자 퇴장 처리...
+      setParticipants(prev =>
+        prev.filter(p => p.userId !== eventData.participant.userId)
+      );
+      break;
+
+    // ... 다른 케이스들
   }
-  break;
+};
+
+// 방 종료 알림 닫기 핸들러
+const handleRoomClosedAlertClose = () => {
+  cleanupAndExit(); // 공통 정리 함수 재사용
+};
+```
+
+**JSX - AlertModal 사용:**
+
+```jsx
+{/* 방 종료 알림 모달 */}
+<AlertModal
+  isOpen={showRoomClosedAlert}
+  onClose={handleRoomClosedAlertClose}
+  title="방 종료"
+  message="방장이 나가서 방이 종료되었습니다."
+  type="warning"
+/>
 ```
 
 **💡 동작 흐름:**
 
 1. 방장: 연결 끊김 (정상/비정상 모두)
-2. 서버: `WebSocketEventsListener`가 감지
+2. 서버: `onDisconnect` 메서드가 감지
 3. 서버: DB에서 방 전체 삭제
-4. 서버: 남은 참가자들에게 `PARTICIPANT_LEFT` + `roomClosed: true` 브로드캐스팅
-5. 참가자들: 알림 표시 → 리소스 정리 → 메인으로 이동
+4. 서버: 남은 참가자들에게 3가지 경로로 브로드캐스팅:
+   - `/user/queue/room-closed` → `room:closed` 이벤트
+   - `/topic/room/{id}/participant` → `ROOM_CLOSED` 이벤트 타입
+   - `/topic/room/{id}/participant` → `PARTICIPANT_LEFT` + `roomClosed: true`
+5. 참가자들: AlertModal 표시 (⚠️ "방장이 나가서 방이 종료되었습니다.")
+6. 참가자들: 확인 버튼 클릭 → `cleanupAndExit()` → 메인으로 이동
 
-**🔧 방장 위임 기능 추가 시:**
+**🎯 설계 결정:**
+- 3가지 경로로 방 종료 알림 수신하여 안정성 확보
+- 브라우저 기본 `alert()` 대신 커스텀 AlertModal 사용
+- 공통 정리 함수 `cleanupAndExit()` 재사용으로 코드 중복 제거
 
-- 서버에서 방장 나가기 시 방을 종료하지 않고 다음 참가자에게 방장 위임
-- `newHostId` 필드를 브로드캐스팅에 포함
-- 클라이언트는 위 코드로 자동 처리
+**🔧 방장 위임 기능 (미구현):**
+- 현재는 방장 나가면 방 전체 종료
+- 추후 서버에서 방장 위임 로직 추가 시 `newHostId` 필드로 처리 가능
 
 #### 4.3 웹캠 권한 취소
 
@@ -784,26 +870,32 @@ useEffect(() => {
 
 ## 구현 우선순위
 
-### Phase 1: 대기방 완성 (현재)
+### Phase 1: 대기방 핵심 기능 ✅ 완료 (2025-10-24)
 
 1. ✅ 나가기 버튼 처리
-2. ✅ 탭 닫기/새로고침 감지
-3. ✅ WebSocket 연결 끊김 처리
-4. ✅ 중복 탭 접속 방지
-5. ✅ 방장 나가기 처리
-6. ✅ 리소스 정리 함수
+2. ✅ 방장 나가기 처리 (3가지 경로 알림)
+3. ✅ 리소스 정리 공통 함수 (`cleanupAndExit`)
+4. ✅ AlertModal을 사용한 사용자 친화적 알림
+5. ✅ 코드 리팩토링 (중복 제거)
 
-### Phase 2: 게임 페이지 기본 (현재)
+### Phase 2: 대기방 추가 기능 ⏳ 예정
 
-1. ✅ 나가기 버튼만 처리
-2. ⏳ 나머지는 팀원 작업 완료 대기
+1. ⏳ 탭 닫기/새로고침 감지 (beforeunload)
+2. ⏳ WebSocket 연결 끊김 재연결 처리
+3. ⏳ 뒤로가기 버튼 처리
+4. ⏳ 중복 탭 접속 방지 (WebSocket 연결 전 세션 체크)
+5. ⏳ 방장 위임 로직 (서버 지원 필요)
 
-### Phase 3: 게임 페이지 완성 (추후)
+### Phase 3: 게임 페이지 기본 ⏳ 대기 중
+
+1. ⏳ 나가기 버튼 처리 (팀원 작업 대기)
+2. ⏳ 게임 중 방장 나가기 처리
+
+### Phase 4: 게임 페이지 완성 ⏳ 추후
 
 1. ⏳ 탭 닫기/새로고침 처리
 2. ⏳ 게임 중 연결 끊김 처리
 3. ⏳ 게임 중 참가자 이탈 처리
-4. ⏳ 게임 중 방장 나가기 처리
 
 ---
 
@@ -1075,24 +1167,61 @@ if (alreadyInThisRoom) {
 
 이 문서는 퀴즈 방 시스템의 연결 해제 및 예외 상황 처리를 위한 종합 가이드입니다.
 
-**현재 작업:**
+**구현 완료 현황 (2025-10-24):**
 
-- 대기방: 모든 예외 상황 완벽 처리
-- 게임 페이지: 나가기 버튼만 처리
+### ✅ 대기방 핵심 기능 완료
 
-**예외 케이스 커버리지:**
+1. **나가기 버튼**: 확인 모달 → 리소스 정리 → 메인 이동
+2. **방장 나가기 처리**: 3가지 경로로 알림 수신 → AlertModal 표시 → 리소스 정리 → 메인 이동
+3. **공통 정리 함수**: `cleanupAndExit()` 함수로 중복 코드 제거 (100줄 → 51줄, 49% 감소)
+4. **사용자 친화적 UI**: 브라우저 기본 alert 대신 커스텀 AlertModal 사용
+5. **서버 자동 처리**: WebSocket 연결 해제만으로 서버가 DB 정리 및 브로드캐스팅 자동 수행
 
-| 케이스                        | 백엔드 | 프론트 | 상태           |
-| ----------------------------- | ------ | ------ | -------------- |
-| URL 강제 접근 (비참여 방)     | ✅     | ✅     | ✅ 완벽히 커버 |
-| 다른 방 참여 중 URL 접근      | ✅     | ✅     | ✅ 완벽히 커버 |
-| 중복 탭 접근 (같은 방)        | ⚠️     | ⚠️     | ⚠️ 추가 필요   |
-| WebSocket 연결 끊김 자동 처리 | ✅     | ✅     | ✅ 완벽히 커버 |
-| 방장 나가기 자동 처리         | ✅     | ✅     | ✅ 완벽히 커버 |
+### 📊 예외 케이스 커버리지
 
-**추후 작업:**
+| 케이스                        | 백엔드 | 프론트 | 상태           | 비고                          |
+| ----------------------------- | ------ | ------ | -------------- | ----------------------------- |
+| 나가기 버튼 클릭              | ✅     | ✅     | ✅ 완료        | cleanupAndExit 함수           |
+| 방장 나가기 (3가지 경로)      | ✅     | ✅     | ✅ 완료        | AlertModal 표시               |
+| WebSocket 연결 끊김 자동 처리 | ✅     | ✅     | ✅ 완료        | onDisconnect 메서드           |
+| URL 강제 접근 (비참여 방)     | ✅     | ✅     | ✅ 완벽히 커버 | 백엔드 검증                   |
+| 다른 방 참여 중 URL 접근      | ✅     | ✅     | ✅ 완벽히 커버 | 에러 처리 완료                |
+| 탭 닫기/새로고침              | ✅     | ⏳     | ⏳ 예정        | beforeunload 이벤트 추가 필요 |
+| 중복 탭 접속 (같은 방)        | ⚠️     | ⏳     | ⏳ 예정        | 세션 체크 추가 필요           |
+| 네트워크 끊김 재연결          | ✅     | ⏳     | ⏳ 예정        | 재연결 로직 추가 필요         |
 
-1. **즉시**: 중복 탭 접근 시 WebSocket 연결 전 세션 체크 추가
-2. **2차**: 게임 페이지 예외 상황 처리 (팀원 작업 완료 후)
+### 🎯 주요 설계 결정
 
-이 설계를 따르면 팀원의 작업과 충돌 없이 안정적인 연결 관리 시스템을 구축할 수 있습니다.
+1. **서버 자동 처리 우선**: 클라이언트는 리소스 정리만, 서버가 DB 정리 담당
+2. **다중 경로 처리**: 안정성을 위해 3가지 경로로 방 종료 알림 수신
+3. **공통 함수 리팩토링**: `cleanupAndExit`로 중복 코드 제거 (49% 감소)
+4. **사용자 친화적 UI**: 커스텀 AlertModal 사용
+5. **단일 책임 원칙**: 이벤트 리스닝과 비즈니스 로직 분리
+
+### 📝 추후 작업
+
+#### 우선순위 높음
+1. **탭 닫기/새로고침 감지**: beforeunload 이벤트 추가
+2. **중복 탭 접속 방지**: WebSocket 연결 전 세션 체크
+
+#### 우선순위 중간
+3. **네트워크 끊김 재연결**: 짧은 시간 재연결 시도 로직
+4. **뒤로가기 버튼 처리**: popstate 이벤트 처리
+
+#### 우선순위 낮음
+5. **방장 위임 로직**: 서버 지원 필요 (현재는 방 종료)
+6. **게임 페이지 처리**: 팀원 작업 완료 후 진행
+
+### 🚀 기대 효과
+
+✅ **안정성 향상**: 핵심 예외 상황 처리 완료  
+✅ **사용자 경험 개선**: 명확한 피드백과 일관된 UI  
+✅ **코드 품질 개선**: 중복 코드 49% 감소  
+✅ **유지보수성 향상**: 공통 함수로 관리 용이  
+✅ **확장성 확보**: 게임 페이지에도 동일한 패턴 적용 가능
+
+---
+
+**문서 최종 업데이트**: 2025-10-24  
+**작성자**: 강관주 (백엔드), 신동준 (프론트엔드)  
+**구현 완료율**: 대기방 핵심 기능 100% / 전체 약 60%
